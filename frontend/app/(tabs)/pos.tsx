@@ -7,6 +7,7 @@ import { api, num, rp, useApi } from "@/src/api";
 import { usesNativeTabs } from "@/src/navigation";
 import { SaleTickets } from "@/src/sale-tickets";
 import { printCloseReport } from "@/src/receipt";
+import { downloadReport } from "@/src/export";
 import { PettyCashSheet, ExternalOrderSheet } from "@/src/pos-extra";
 import { useAuth } from "@/src/auth";
 import { Handover, KioskAttendance, LiveAttendance, OpenRegister, useLiveAttendance } from "@/src/pos-shift";
@@ -436,7 +437,18 @@ export default function POS() {
               </Card>
             )}
             {!!closeReceipt.selisih_note && <Text style={s.sub} testID="report-selisih-note">Alasan selisih: {closeReceipt.selisih_note}</Text>}
-            <Btn title="Cetak Laporan" icon="print-outline" testID="print-close-report-button" onPress={() => printCloseReport(closeReceipt, settings)} />
+            <Btn title="Cetak Laporan (Thermal 58mm)" icon="print-outline" testID="print-close-report-button" onPress={() => printCloseReport(closeReceipt, settings)} />
+            {can("reports") && (
+              <Btn title="Unduh Excel" variant="secondary" icon="download-outline" testID="close-report-download-excel-button"
+                onPress={async () => {
+                  try {
+                    await downloadReport(`/reports/tutupkasir/export?start=${closeReceipt.date}&end=${closeReceipt.date}`, `TutupKasir_${closeReceipt.date}.xlsx`);
+                    toast("Laporan Excel diunduh");
+                  } catch (e: any) {
+                    toast(e?.message || "Gagal mengunduh", "error");
+                  }
+                }} />
+            )}
             <Btn title="Selesai" variant="secondary" testID="close-report-done-button" onPress={() => setCloseReceipt(null)} />
           </View>
         )}

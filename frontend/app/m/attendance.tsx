@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FlatList, Image, Pressable, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { api, num, useApi } from "@/src/api";
+import { api, num, useApi, TOKEN_KEY } from "@/src/api";
 import { useAuth } from "@/src/auth";
 import { CameraSheet } from "@/src/camera";
+import { storage } from "@/src/utils/storage";
 import { Badge, Btn, Card, Chips, Field, Header, Icon, Page, Sheet, sp, StateView, useStyles, useToast } from "@/src/ui";
 import { useTheme } from "@/src/theme";
 
@@ -25,6 +26,12 @@ export default function Attendance() {
   const [busy, setBusy] = useState(false);
   const [camType, setCamType] = useState<string | null>(null); // clock_in | clock_out -> open camera
   const [viewPhoto, setViewPhoto] = useState<string | null>(null);
+  const [token, setToken] = useState("");
+  useEffect(() => {
+    storage.secureGet<string | null>(TOKEN_KEY, null).then((t) => setToken(t || ""));
+  }, []);
+  const photoUri = (p?: string | null) =>
+    p && p.startsWith("/api/") ? `${process.env.EXPO_PUBLIC_BACKEND_URL}${p}?auth=${token}` : p || undefined;
 
   const decide = async (id: string, approve: boolean) => {
     try {
@@ -100,8 +107,8 @@ export default function Attendance() {
         renderItem={({ item: a }) => (
           <Card style={[s.row, { justifyContent: "space-between" }]}>
             {a.photo ? (
-              <Pressable testID={`att-photo-${a.id}`} onPress={() => setViewPhoto(a.photo)}>
-                <Image source={{ uri: a.photo }} style={{ width: 48, height: 48, borderRadius: 10, backgroundColor: colors.surfaceTertiary }} />
+              <Pressable testID={`att-photo-${a.id}`} onPress={() => setViewPhoto(photoUri(a.photo) || null)}>
+                <Image source={{ uri: photoUri(a.photo) }} style={{ width: 48, height: 48, borderRadius: 10, backgroundColor: colors.surfaceTertiary }} />
               </Pressable>
             ) : (
               <View style={{ width: 48, height: 48, borderRadius: 10, backgroundColor: colors.surfaceTertiary, alignItems: "center", justifyContent: "center" }}>

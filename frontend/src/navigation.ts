@@ -18,6 +18,7 @@ export const MODULES = [
   { key: "reports", title: "Laporan", icon: "bar-chart-outline", perm: "reports", route: "/m/reports" },
   { key: "sales-recap", title: "Rekap Penjualan", icon: "trending-up-outline", perm: "reports", route: "/m/sales-recap" },
   { key: "users", title: "Karyawan", icon: "people-outline", perm: "users", route: "/m/users" },
+  { key: "access", title: "Hak Akses", icon: "shield-checkmark-outline", perm: "users", route: "/m/access" },
 ] as const;
 
 export const LOCS = [

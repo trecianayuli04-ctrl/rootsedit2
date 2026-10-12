@@ -1,0 +1,9 @@
+crons:
+  - name: nightly-tutupkasir
+    description: "Kirim email rekap tutup kasir harian ke Owner & Finance tiap malam 23:00 WIB"
+    cron: "0 23 * * *"
+    timezone: "Asia/Jakarta"
+    endpoint: "{{BASE_URL}}/api/cron/daily-close-report"
+    method: POST
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    enabled: true

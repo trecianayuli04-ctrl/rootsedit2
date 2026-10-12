@@ -7,7 +7,15 @@ import { api, setOnUnauthorized, TOKEN_KEY } from "@/src/api";
 import { storage } from "@/src/utils/storage";
 
 export type Role = "owner" | "manager" | "supervisor" | "finance" | "marketing" | "crew";
-export type User = { id: string; email: string; name: string; role: Role; position: string };
+export type User = { id: string; email: string; name: string; role: Role; position: string; access?: string[] };
+
+// Permissions the Owner can reassign from the Access Control screen — for these we trust the
+// server-provided `access` list (so an Owner can REVOKE a default). Everything else uses the static map.
+const OVERRIDABLE = new Set<string>([
+  "finance", "payroll", "audit", "petty_cash_approve", "sales_void", "reports", "settings",
+  "menu_edit", "inventory_move", "opname", "waste", "waste_approve", "purchase",
+  "purchase_approve", "purchase_receive", "attendance_all", "overtime_approve",
+]);
 
 const ALL: Role[] = ["owner", "manager", "supervisor", "finance", "marketing", "crew"];
 const OPS: Role[] = ["owner", "manager", "supervisor", "crew"];
@@ -148,7 +156,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const can = (p: string) => !!user && (PERM[p] || []).includes(user.role);
+  const can = (p: string) => {
+    if (!user) return false;
+    const dyn = user.access;
+    if (OVERRIDABLE.has(p)) return dyn ? dyn.includes(p) : (PERM[p] || []).includes(user.role);
+    if (dyn && dyn.includes(p)) return true;
+    return (PERM[p] || []).includes(user.role);
+  };
 
   return <AuthCtx.Provider value={{ user, loading, login, logout, can, loginWithGoogle, googleError }}>{children}</AuthCtx.Provider>;
 }

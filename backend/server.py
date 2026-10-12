@@ -1,16 +1,19 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, UploadFile, File, Header, Query, Response, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import os, uuid, logging, bcrypt, jwt, httpx
-import io
+import io, re, hmac, asyncio, ipaddress, requests
+from html import escape
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
@@ -59,6 +62,29 @@ REPORTS = {
     "attendance": ["owner", "manager", "supervisor", "finance"], "marketing": ["owner", "marketing", "manager"],
 }
 
+ALL_ROLES = ["owner", "manager", "supervisor", "finance", "marketing", "crew"]
+# Permission keys the Owner may re-assign from the dashboard, grouped into UI categories.
+ACCESS_CATALOG = [
+    {"group": "Keuangan", "perms": ["finance", "payroll", "audit", "petty_cash_approve"]},
+    {"group": "Void / Batal", "perms": ["sales_void"]},
+    {"group": "Laporan", "perms": ["reports"]},
+    {"group": "Pengaturan", "perms": ["settings", "menu_edit"]},
+    {"group": "Inventory", "perms": ["inventory_move", "opname", "waste", "waste_approve", "purchase", "purchase_approve", "purchase_receive"]},
+    {"group": "Payroll", "perms": ["payroll"]},
+    {"group": "Absensi", "perms": ["attendance_all", "overtime_approve"]},
+]
+CONFIG_PERM_KEYS = sorted({p for g in ACCESS_CATALOG for p in g["perms"]})
+PERM_LABELS = {
+    "finance": "Lihat & kelola Keuangan", "payroll": "Payroll / gaji", "audit": "Audit trail",
+    "petty_cash_approve": "Setujui kas kecil", "sales_void": "Void / batalkan transaksi",
+    "reports": "Lihat & unduh Laporan", "settings": "Ubah Pengaturan", "menu_edit": "Edit Menu & Resep",
+    "inventory_move": "Mutasi stok", "opname": "Stock opname", "waste": "Input waste",
+    "waste_approve": "Setujui waste", "purchase": "Buat PR/PO", "purchase_approve": "Setujui PO",
+    "purchase_receive": "Terima barang", "attendance_all": "Lihat absensi semua", "overtime_approve": "Setujui lembur",
+}
+# "reports" is a virtual permission (not in PERM): grants viewing/exporting all reports.
+_PERM_DEFAULTS = {**PERM, "reports": ["owner", "manager", "supervisor", "finance", "marketing"]}
+
 
 def now():
     return datetime.now(TZ)
@@ -85,10 +111,51 @@ def make_token(u):
     return jwt.encode({"sub": u["id"], "role": u["role"], "iat": t, "exp": t + timedelta(hours=12)}, JWT_SECRET, algorithm="HS256")
 
 
+_access_cache = {"doc": None}
+
+
+async def get_access():
+    if _access_cache["doc"] is None:
+        doc = await db.access.find_one({"outlet_id": OUTLET}, {"_id": 0})
+        _access_cache["doc"] = doc or {"perms": {}}
+    return _access_cache["doc"]
+
+
+def _invalidate_access():
+    _access_cache["doc"] = None
+
+
+async def perm_roles(perm):
+    """Effective roles for a permission key, honoring Owner overrides. Owner always allowed."""
+    acc = await get_access()
+    override = (acc.get("perms") or {}).get(perm)
+    roles = list(override) if override is not None else list(_PERM_DEFAULTS.get(perm, []))
+    if "owner" not in roles:
+        roles.append("owner")
+    return roles
+
+
+async def allowed_perms_for(role):
+    acc = await get_access()
+    ov = acc.get("perms") or {}
+    out = []
+    for k in set(list(_PERM_DEFAULTS.keys())):
+        roles = ov.get(k) if ov.get(k) is not None else _PERM_DEFAULTS.get(k, [])
+        if role == "owner" or role in roles:
+            out.append(k)
+    return out
+
+
 def public_user(u):
     out = {k: u.get(k) for k in ["id", "email", "name", "role", "position", "base_salary", "allowance", "is_active", "outlet_id",
                                   "hourly_rate", "overtime_rate", "shift_start"]}
     out["has_pin"] = bool(u.get("pin_hash"))
+    return out
+
+
+async def public_user_with_access(u):
+    out = public_user(u)
+    out["access"] = await allowed_perms_for(u["role"])
     return out
 
 
@@ -107,10 +174,18 @@ async def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)):
 
 def need(perm):
     async def dep(u=Depends(current_user)):
-        if u["role"] not in PERM[perm]:
+        if u["role"] not in await perm_roles(perm):
             raise HTTPException(403, "Akses ditolak untuk jabatan Anda")
         return u
     return dep
+
+
+async def report_roles(rtype):
+    """Reports are governed by the single 'reports' permission plus the per-type default floor."""
+    base = set(await perm_roles("reports"))
+    base &= set(REPORTS.get(rtype, ALL_ROLES) + ["owner"])
+    base.add("owner")
+    return list(base)
 
 
 async def find(col, q=None, sort="created_at", limit=1000):
@@ -122,6 +197,176 @@ async def insert(col, doc):
     doc = {"id": nid(), "outlet_id": OUTLET, "created_at": now().isoformat(), "date": today(), **doc}
     await db[col].insert_one(dict(doc))
     return doc
+
+
+# ---------------- Object storage (Emergent) ----------------
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+APP_NAME = "rollow-pos"
+_storage_key = {"v": None}
+
+
+def init_storage(force=False):
+    if _storage_key["v"] and not force:
+        return _storage_key["v"]
+    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
+    resp.raise_for_status()
+    _storage_key["v"] = resp.json()["storage_key"]
+    return _storage_key["v"]
+
+
+def put_object(path, data, content_type):
+    key = init_storage()
+    resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    if resp.status_code == 404:
+        key = init_storage(force=True)
+        resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_object(path):
+    key = init_storage()
+    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    if resp.status_code == 404:
+        key = init_storage(force=True)
+        resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+
+
+def _decode_data_url(s):
+    """Accepts a data URL or bare base64 string; returns (bytes, ext, mime)."""
+    import base64
+    mime = "image/jpeg"
+    b64 = s
+    if s.startswith("data:"):
+        head, b64 = s.split(",", 1)
+        mime = head[5:].split(";")[0] or mime
+    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
+    return base64.b64decode(b64), ext, mime
+
+
+async def store_photo(user_id, photo):
+    """Upload a base64/data-url selfie to object storage, return served path (api route)."""
+    if not photo:
+        return ""
+    if photo.startswith("http") or photo.startswith("/api/"):
+        return photo  # already a URL
+    try:
+        data, ext, mime = _decode_data_url(photo)
+        path = f"{APP_NAME}/attendance/{user_id}/{uuid.uuid4()}.{ext}"
+        res = await asyncio.to_thread(put_object, path, data, mime)
+        await db.files.insert_one({"id": nid(), "outlet_id": OUTLET, "storage_path": res["path"],
+                                   "content_type": mime, "size": res.get("size"), "is_deleted": False,
+                                   "created_at": now().isoformat()})
+        return f"/api/files/{res['path']}"
+    except Exception as e:
+        logging.getLogger(__name__).error(f"store_photo failed: {e}")
+        return ""
+
+
+# ---------------- Email (Emergent-managed Resend) ----------------
+EMAIL_BASE_URL = "https://integrations.emergentagent.com"
+EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY")
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "ROLLOW POS")
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
+_SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
+_CRED_ASK = ("reply with your password", "reply with the code", "send your password", "cvv",
+             "send us your password", "enter your password below", "confirm your card number",
+             "your full card number", "seed phrase", "recovery phrase", "verify your card",
+             "social security number", "confirm your bank details")
+_HOSTISH = re.compile(r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})", re.I)
+
+
+def _host_ok(host):
+    if not host or "xn--" in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return not any(host == s or host.endswith("." + s) for s in _SHORTENERS)
+
+
+def _same_site(shown, real):
+    return shown == real or real.endswith("." + shown) or shown.endswith("." + real)
+
+
+class _EmailScan(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags, self.urls, self.anchors = set(), [], []
+        self._href, self._text = None, []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.add(tag.lower())
+        self.urls += [v for k, v in attrs if k.lower() in ("href", "src") and v]
+        if tag.lower() == "a":
+            self._href = dict((k.lower(), v) for k, v in attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            self.anchors.append((self._href, "".join(self._text)))
+            self._href, self._text = None, []
+
+
+def _assert_safe_email(subject, html):
+    scan = _EmailScan()
+    scan.feed(html)
+    if scan.tags & {"form", "input", "textarea", "select"}:
+        raise ValueError("No forms or input fields in email (G2)")
+    body = f"{subject}\n{html}".lower()
+    for p in _CRED_ASK:
+        if p in body:
+            raise ValueError(f"Email asks the recipient for credentials: {p!r} (G2)")
+    for url in scan.urls:
+        low = url.strip().lower()
+        if low.startswith(("mailto:", "tel:", "cid:", "#")):
+            continue
+        if not low.startswith("https://"):
+            raise ValueError(f"Email links/assets must be absolute https: {url!r} (G3)")
+        host = urlparse(low).hostname or ""
+        if not _host_ok(host) or urlparse(low).username is not None:
+            raise ValueError(f"Shortened/numeric/credential URL: {url!r} (G3)")
+    for href, text in scan.anchors:
+        real = urlparse(href.strip().lower()).hostname or ""
+        if not real:
+            continue
+        for m in _HOSTISH.finditer(text):
+            if not _same_site(m.group(1).lower(), real):
+                raise ValueError(f"Anchor text {m.group(1)!r} != link host {real!r} (G3)")
+
+
+async def send_email(*, to, subject, html, attachments=None):
+    _assert_safe_email(subject, html)
+    if not EMAIL_KEY:
+        logging.getLogger(__name__).warning("EMERGENT_EMAIL_KEY missing; skip email")
+        return None
+    payload = {"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME}
+    if EMAIL_REPLY_TO:
+        payload["contact_email"] = EMAIL_REPLY_TO
+    if attachments:
+        payload["attachments"] = attachments
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(f"{EMAIL_BASE_URL}/api/v1/email/send", headers={"X-Email-Key": EMAIL_KEY}, json=payload)
+        resp.raise_for_status()
+        return resp.json().get("id")
+    except httpx.HTTPStatusError as e:
+        logging.getLogger(__name__).warning(f"Email send failed {e.response.status_code}: {e.response.text[:200]}")
+        return None
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Email error: {e}")
+        return None
+
 
 
 # ---------------- Inventory core ----------------
@@ -403,7 +648,7 @@ async def login(data: LoginIn):
     u = await db.users.find_one({"email": data.email.lower().strip()}, {"_id": 0})
     if not u or not verify_pw(data.password, u["password_hash"]) or not u.get("is_active", True):
         raise HTTPException(401, "Email atau password salah")
-    return {"access_token": make_token(u), "user": public_user(u)}
+    return {"access_token": make_token(u), "user": await public_user_with_access(u)}
 
 
 class SessionIn(BaseModel):
@@ -424,12 +669,12 @@ async def google_session(data: SessionIn):
     if not u or not u.get("is_active", True):
         raise HTTPException(403, f"Email {email} belum terdaftar. Minta Owner menambahkan Anda di menu Karyawan.")
     token = make_token(u)
-    return {"session_token": token, "access_token": token, "user": public_user(u)}
+    return {"session_token": token, "access_token": token, "user": await public_user_with_access(u)}
 
 
 @api.get("/auth/me")
 async def me(u=Depends(current_user)):
-    return public_user(u)
+    return await public_user_with_access(u)
 
 
 @api.get("/users")
@@ -975,7 +1220,7 @@ class CloseIn(BaseModel):
 
 
 @api.post("/pos/close")
-async def pos_close(data: CloseIn, u=Depends(need("pos"))):
+async def pos_close(data: CloseIn, background: BackgroundTasks, u=Depends(need("pos"))):
     sess = await open_session()
     if not sess:
         raise HTTPException(400, "Kasir belum dibuka")
@@ -1000,6 +1245,7 @@ async def pos_close(data: CloseIn, u=Depends(need("pos"))):
                                            "selisih": selisih, "selisih_note": note})
     await db.register_sessions.update_one({"id": sess["id"]}, {"$set": {"status": "closed", "shifts": shifts, "closed_by": u["name"], "closed_at": t.isoformat()}})
     await db.sales.update_many({"session_id": sess["id"]}, {"$set": {"closed": True}})
+    background.add_task(email_close_report, rec["date"], "tutup kasir")
     return rec
 
 
@@ -1210,9 +1456,12 @@ async def record_attendance(emp, type_, note, hours, by_name, photo=""):
         extra = {"late_minutes": late, "is_late": late > st["late_tolerance_min"], "shift_start": emp.get("shift_start")}
     if type_ == "lembur":
         extra = {"status": "pending"}
+    if type_ in ("clock_in", "clock_out") and not photo:
+        raise HTTPException(400, "Foto wajib untuk clock in/out")
+    photo_url = await store_photo(emp["id"], photo) if photo else ""
     return await insert("attendance", {"type": type_, "note": note, "hours": hours, "user_id": emp["id"], "user_name": emp["name"],
                                        "role": emp["role"], "time": t.strftime("%H:%M"), "ts": t.isoformat(),
-                                       "recorded_by": by_name, "photo": photo or "", **extra})
+                                       "recorded_by": by_name, "photo": photo_url or photo or "", **extra})
 
 
 @api.post("/attendance")
@@ -1458,19 +1707,12 @@ def _title_block(ws, cafe, label, period_label, ncols):
         ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncols)
 
 
-@api.get("/reports/{rtype}/export")
-async def export_report(rtype: str, period: str = "day", date: Optional[str] = None, u=Depends(current_user)):
-    if rtype not in ("sales", "finance", "nota"):
-        raise HTTPException(404, "Unduhan Excel tidak tersedia untuk laporan ini")
-    if u["role"] not in ("owner", "finance"):
-        raise HTTPException(403, "Hanya Owner & Finance yang dapat mengunduh laporan")
-    p = rng(period, date)
-    q = {"date": {"$regex": f"^{p}"}}
-    st = await get_settings()
-    cafe = (st.get("receipt") or {}).get("cafe_name") or "ROLLOW"
-    label = {"sales": "Rekap Penjualan", "finance": "Laporan Keuangan", "nota": "Rekap per Nota"}[rtype]
+async def build_report_bytes(rtype, q, plabel, cafe):
+    label = {"sales": "Rekap Penjualan", "finance": "Laporan Keuangan",
+             "nota": "Rekap per Nota", "tutupkasir": "Laporan Tutup Kasir"}.get(rtype, "Laporan")
     wb = Workbook()
     wb.remove(wb.active)
+    p = plabel
 
     if rtype == "sales":
         allsales = await find("sales", q, limit=20000)
@@ -1589,22 +1831,178 @@ async def export_report(rtype: str, period: str = "day", date: Optional[str] = N
             r += 1
         _autosize(ws)
 
+    elif rtype == "tutupkasir":
+        closes = await find("register_closes", q, limit=5000)
+        methods = sorted({m for c in closes for m in (c.get("by_method_detail") or {}).keys()})
+        ws = wb.create_sheet("Tutup Kasir")
+        _title_block(ws, cafe, "Rekap Laporan Tutup Kasir", p, 10 + len(methods))
+        heads = ["Tanggal", "Jam Tutup", "Ditutup oleh", "Transaksi", "Kotor", "Diskon", "Pajak", "Bersih"] + \
+                [f"{m} (Rp)" for m in methods] + ["Void (x)", "Void (Rp)", "Kas Sistem", "Kas Aktual", "Selisih"]
+        _sheet_header(ws, heads, 5)
+        r = 6
+        for c in sorted(closes, key=lambda x: (x.get("date", ""), x.get("created_at", ""))):
+            bmd = c.get("by_method_detail") or {}
+            vals = [c.get("date", ""), (c.get("created_at") or "")[11:16], c.get("user_name", ""),
+                    c.get("count", 0), round(c.get("gross", 0), 2), round(c.get("discount", 0), 2),
+                    round(c.get("tax", 0), 2), round(c.get("net", c.get("total", 0)), 2)]
+            vals += [round((bmd.get(m) or {}).get("amount", 0), 2) for m in methods]
+            vals += [c.get("void_count", 0), round(c.get("void_amount", 0), 2),
+                     round(c.get("kas_sistem", 0), 2), round(c.get("kas_aktual", 0), 2), round(c.get("selisih", 0), 2)]
+            for ci, v in enumerate(vals, start=1):
+                ws.cell(row=r, column=ci, value=v).border = _BORDER
+            r += 1
+        _autosize(ws)
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    fname = f"{label.replace(' ', '')}_{p}.xlsx"
-    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    return buf.getvalue(), label
+
+
+def _date_query(period, date, start, end):
+    """Returns (mongo_query, human_label). Custom start/end overrides period/date."""
+    if start and end:
+        return {"date": {"$gte": start, "$lte": end}}, (f"{start} s/d {end}" if start != end else start)
+    p = rng(period, date)
+    return {"date": {"$regex": f"^{p}"}}, p
+
+
+@api.get("/reports/{rtype}/export")
+async def export_report(rtype: str, period: str = "day", date: Optional[str] = None,
+                        start: Optional[str] = None, end: Optional[str] = None, u=Depends(current_user)):
+    if rtype not in ("sales", "finance", "nota", "tutupkasir"):
+        raise HTTPException(404, "Unduhan Excel tidak tersedia untuk laporan ini")
+    rtkey = "sales" if rtype in ("sales", "nota", "tutupkasir") else rtype
+    allowed = await report_roles(rtkey)
+    if u["role"] not in allowed or u["role"] not in ("owner", "finance", "manager", "supervisor"):
+        raise HTTPException(403, "Akses laporan ditolak untuk jabatan Anda")
+    q, plabel = _date_query(period, date, start, end)
+    st = await get_settings()
+    cafe = (st.get("receipt") or {}).get("cafe_name") or "ROLLOW"
+    content, label = await build_report_bytes(rtype, q, plabel, cafe)
+    fname = f"{label.replace(' ', '')}_{plabel.replace(' ', '').replace('/', '-')}.xlsx"
+    return StreamingResponse(io.BytesIO(content), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
+# ---------------- Access control (Owner-configurable permissions) ----------------
+class AccessIn(BaseModel):
+    perms: Dict[str, List[str]]
+
+
+@api.get("/access")
+async def get_access_matrix(u=Depends(need("users"))):
+    acc = await get_access()
+    ov = acc.get("perms") or {}
+    keys = CONFIG_PERM_KEYS + ["reports"]
+    perms = {}
+    for k in keys:
+        roles = ov.get(k) if ov.get(k) is not None else _PERM_DEFAULTS.get(k, [])
+        perms[k] = sorted(set(roles) | {"owner"})
+    return {"catalog": ACCESS_CATALOG, "roles": ALL_ROLES, "labels": PERM_LABELS, "perms": perms,
+            "defaults": {k: sorted(set(_PERM_DEFAULTS.get(k, [])) | {"owner"}) for k in keys}}
+
+
+@api.put("/access")
+async def set_access_matrix(data: AccessIn, u=Depends(need("users"))):
+    allowed_keys = set(CONFIG_PERM_KEYS + ["reports"])
+    clean = {}
+    for k, roles in data.perms.items():
+        if k not in allowed_keys:
+            continue
+        rs = sorted({r for r in roles if r in ALL_ROLES} | {"owner"})
+        clean[k] = rs
+    await db.access.update_one({"outlet_id": OUTLET},
+                               {"$set": {"perms": clean, "outlet_id": OUTLET, "updated_at": now().isoformat(), "updated_by": u["name"]}},
+                               upsert=True)
+    _invalidate_access()
+    await audit("access", OUTLET, "access.update", u, after={"perms": clean})
+    return {"ok": True, "perms": clean}
+
+
+# ---------------- Secure file serving (object storage) ----------------
+@api.get("/files/{path:path}")
+async def serve_file(path: str, authorization: str = Header(None), auth: str = Query(None)):
+    cred = authorization or (f"Bearer {auth}" if auth else None)
+    if not cred or not cred.startswith("Bearer "):
+        raise HTTPException(401, "Butuh otorisasi")
+    try:
+        jwt.decode(cred.split(" ", 1)[1], JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Token tidak valid")
+    rec = await db.files.find_one({"storage_path": path, "is_deleted": False}, {"_id": 0})
+    if not rec:
+        raise HTTPException(404, "File tidak ditemukan")
+    data, ct = await asyncio.to_thread(get_object, path)
+    return Response(content=data, media_type=rec.get("content_type", ct))
+
+
+# ---------------- Email: daily tutup kasir report ----------------
+async def _report_recipients():
+    users = await find("users", limit=1000)
+    seen, out = set(), []
+    for x in users:
+        if x.get("role") in ("owner", "finance") and x.get("is_active", True) and x.get("email"):
+            em = x["email"].strip().lower()
+            if em and em not in seen:
+                seen.add(em)
+                out.append((x["name"], em))
+    return out
+
+
+async def email_close_report(date_str, context="tutup kasir"):
+    """Build the day's tutup-kasir Excel and email it to Owner & Finance. Best-effort."""
+    try:
+        recipients = await _report_recipients()
+        if not recipients:
+            return
+        st = await get_settings()
+        cafe = (st.get("receipt") or {}).get("cafe_name") or "ROLLOW"
+        q = {"date": date_str}
+        content, label = await build_report_bytes("tutupkasir", q, date_str, cafe)
+        import base64
+        b64 = base64.b64encode(content).decode()
+        fname = f"TutupKasir_{date_str}.xlsx"
+        subject = f"{cafe} — Laporan Tutup Kasir {date_str}"
+        html = (f'<table role="presentation" width="100%"><tr><td style="padding:24px;font-family:Arial,sans-serif;color:#222">'
+                f'<h2 style="color:#1F6F54;margin:0 0 8px">{escape(cafe)} — Laporan Tutup Kasir</h2>'
+                f'<p>Berikut rekap tutup kasir tanggal <strong>{escape(date_str)}</strong> (otomatis dari {escape(context)}).</p>'
+                f'<p>File Excel terlampir berisi ringkasan penjualan, rincian per metode bayar, void, dan rekonsiliasi kas.</p>'
+                f'<p style="font-size:12px;color:#888;margin-top:24px">Email otomatis dari {escape(cafe)}. '
+                f'Kami tidak pernah meminta password atau data kartu Anda melalui email.</p></td></tr></table>')
+        attachments = [{"filename": fname, "content": b64}]
+        for _name, em in recipients:
+            await send_email(to=em, subject=subject, html=html, attachments=attachments)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"email_close_report failed: {e}")
+
+
+@api.post("/cron/daily-close-report")
+async def cron_daily_close_report(request: Request, background: BackgroundTasks,
+                                  authorization: str = Header(None), x_webhook_id: str = Header(None)):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
+    token = authorization.split(" ", 1)[1] if authorization and authorization.startswith("Bearer ") else ""
+    if not secret or not hmac.compare_digest(token, secret):
+        raise HTTPException(401, "Unauthorized")
+    run_id = x_webhook_id or nid()
+    if await db.cron_runs.find_one({"run_id": run_id}):
+        return {"ok": True, "duplicate": True}
+    await db.cron_runs.insert_one({"run_id": run_id, "at": now().isoformat(), "job": "daily-close-report"})
+    date_str = today()
+    background.add_task(email_close_report, date_str, "jadwal malam")
+    return {"ok": True, "queued_for": date_str}
+
+
 @api.get("/reports/{rtype}")
-async def report(rtype: str, period: str = "day", date: Optional[str] = None, u=Depends(current_user)):
+async def report(rtype: str, period: str = "day", date: Optional[str] = None,
+                 start: Optional[str] = None, end: Optional[str] = None, u=Depends(current_user)):
     if rtype not in REPORTS:
         raise HTTPException(404, "Laporan tidak ada")
-    if u["role"] not in REPORTS[rtype]:
+    if u["role"] not in await report_roles(rtype):
         raise HTTPException(403, "Akses ditolak")
-    p = rng(period, date)
-    q = {"date": {"$regex": f"^{p}"}}
+    q, _plabel = _date_query(period, date, start, end)
+    p = _plabel
     S, rows = {}, []
     if rtype == "sales":
         sales = await find("sales", {**q, **VALID_SALE})
@@ -2012,6 +2410,11 @@ async def list_audit(start: Optional[str] = None, end: Optional[str] = None, ent
 # ---------------- Seed ----------------
 @app.on_event("startup")
 async def seed():
+    try:
+        await asyncio.to_thread(init_storage)
+        logging.getLogger(__name__).info("Object storage initialized")
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Storage init failed: {e}")
     await db.users.create_index("email", unique=True)
     pw = os.environ["DEMO_PASSWORD"]
     owner_email = os.environ["OWNER_EMAIL"].lower()

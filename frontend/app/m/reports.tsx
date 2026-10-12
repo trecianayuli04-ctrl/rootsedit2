@@ -5,12 +5,12 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { rp, useApi } from "@/src/api";
 import { Role, useAuth } from "@/src/auth";
 import { downloadReport } from "@/src/export";
-import { Btn, Card, Chips, Header, Icon, Page, sp, Stat, StateView, useStyles, useToast } from "@/src/ui";
+import { Btn, Card, Chips, Field, Header, Icon, Page, sp, Stat, StateView, useStyles, useToast } from "@/src/ui";
 import { useTheme } from "@/src/theme";
 
 const OPSM: Role[] = ["owner", "manager", "supervisor"];
 const EXPORTABLE = new Set(["sales", "finance", "nota"]);
-const EXPORT_ROLES: Role[] = ["owner", "finance"];
+const EXPORT_ROLES: Role[] = ["owner", "finance", "manager", "supervisor"];
 const TYPES: { value: string; label: string; roles: Role[] }[] = [
   { value: "sales", label: "Penjualan", roles: ["owner", "manager", "supervisor", "finance", "marketing"] },
   { value: "nota", label: "Rekap per Nota", roles: [...OPSM, "finance"] },
@@ -41,17 +41,21 @@ export default function Reports() {
   const [type, setType] = useState(types[0]?.value ?? "sales");
   const [period, setPeriod] = useState("day");
   const [date, setDate] = useState(() => shift(new Date().toISOString().slice(0, 10), "day", 0));
+  const [start, setStart] = useState(() => shift(new Date().toISOString().slice(0, 10), "day", -6));
+  const [end, setEnd] = useState(() => shift(new Date().toISOString().slice(0, 10), "day", 0));
   const [downloading, setDownloading] = useState(false);
-  const { data, loading, error, reload } = useApi<any>(`/reports/${type}?period=${period}&date=${date}`);
+  const custom = period === "custom";
+  const qs = custom ? `start=${start}&end=${end}` : `period=${period}&date=${date}`;
+  const { data, loading, error, reload } = useApi<any>(`/reports/${type}?${qs}`);
   const isCount = (k: string) => type === "attendance" || MONEY_LABELS.includes(k);
   const canExport = EXPORTABLE.has(type) && EXPORT_ROLES.includes(user!.role);
+  const rangeLabel = custom ? `${start} s/d ${end}` : period === "day" ? date : date.slice(0, 7);
 
   const onDownload = async () => {
-    const ref = period === "day" ? date : date.slice(0, 7);
     const label = TYPES.find((t) => t.value === type)?.label || type;
     setDownloading(true);
     try {
-      await downloadReport(`/reports/${type}/export?period=${period}&date=${date}`, `${label}_${ref}.xlsx`);
+      await downloadReport(`/reports/${type}/export?${qs}`, `${label}_${rangeLabel.replace(/[ /]/g, "-")}.xlsx`);
       toast("Laporan Excel diunduh");
     } catch (e: any) {
       toast(e?.message || "Gagal mengunduh laporan");
@@ -62,16 +66,26 @@ export default function Reports() {
 
   return (
     <Page>
-      <Header back title="Laporan" subtitle="Harian / bulanan" />
+      <Header back title="Laporan" subtitle="Harian / bulanan / rentang tanggal" />
       <Chips testPrefix="report-type" value={type} onChange={setType} options={types} />
       <View style={[s.row, { paddingHorizontal: sp.lg, justifyContent: "space-between" }]}>
         <View style={{ flex: 1, marginLeft: -sp.lg }}>
-          <Chips testPrefix="report-period" value={period} onChange={setPeriod} options={[{ label: "Harian", value: "day" }, { label: "Bulanan", value: "month" }]} />
+          <Chips testPrefix="report-period" value={period} onChange={setPeriod} options={[{ label: "Harian", value: "day" }, { label: "Bulanan", value: "month" }, { label: "Rentang", value: "custom" }]} />
         </View>
-        <Pressable testID="report-prev-button" hitSlop={8} onPress={() => setDate(shift(date, period, -1))} style={{ padding: sp.sm }}><Icon name="chevron-back" size={22} color={colors.onSurface} /></Pressable>
-        <Text style={s.title} testID="report-range-text">{period === "day" ? date : date.slice(0, 7)}</Text>
-        <Pressable testID="report-next-button" hitSlop={8} onPress={() => setDate(shift(date, period, 1))} style={{ padding: sp.sm }}><Icon name="chevron-forward" size={22} color={colors.onSurface} /></Pressable>
+        {!custom && (
+          <>
+            <Pressable testID="report-prev-button" hitSlop={8} onPress={() => setDate(shift(date, period, -1))} style={{ padding: sp.sm }}><Icon name="chevron-back" size={22} color={colors.onSurface} /></Pressable>
+            <Text style={s.title} testID="report-range-text">{rangeLabel}</Text>
+            <Pressable testID="report-next-button" hitSlop={8} onPress={() => setDate(shift(date, period, 1))} style={{ padding: sp.sm }}><Icon name="chevron-forward" size={22} color={colors.onSurface} /></Pressable>
+          </>
+        )}
       </View>
+      {custom && (
+        <View style={[s.row, { paddingHorizontal: sp.lg, gap: sp.md }]}>
+          <View style={{ flex: 1 }}><Field label="Dari (YYYY-MM-DD)" testID="report-start-input" value={start} onChangeText={setStart} placeholder="2026-10-01" /></View>
+          <View style={{ flex: 1 }}><Field label="Sampai (YYYY-MM-DD)" testID="report-end-input" value={end} onChangeText={setEnd} placeholder="2026-10-31" /></View>
+        </View>
+      )}
       {canExport && (
         <View style={{ paddingHorizontal: sp.lg, paddingBottom: sp.sm }}>
           <Btn small variant="secondary" title="Unduh Excel" icon="download-outline" testID="report-download-excel-button" loading={downloading} onPress={onDownload} />
