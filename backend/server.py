@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,6 +10,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import os, uuid, logging, bcrypt, jwt, httpx
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -608,6 +612,7 @@ DEFAULT_SETTINGS = {
     "loyalty_enabled": True, "points_per_nota": 1, "points_min_purchase": 0, "points_per_amount": 0,
     "petty_cash_limit": 50000.0,
     "stock_mode": "detailed",  # detailed = gudang/bar/kitchen terpisah | simple = satu stok total
+    "close_report_detail": True,  # True = laporan tutup kasir rinci (per metode, void, pajak) | False = ringkas
     "petty_cash_needs_approval": False,
     "printer": {"paper_width": 58},
     "qris": {"provider": "", "merchant_name": "", "merchant_id": "", "bank_name": "", "account_no": "", "account_name": "",
@@ -633,6 +638,7 @@ class SettingsIn(BaseModel):
     late_penalty_per_minute: float = 0
     petty_cash_limit: float = 50000
     stock_mode: str = "detailed"
+    close_report_detail: bool = True
     petty_cash_needs_approval: bool = False
     printer: dict = {}
     qris: dict = {}
@@ -905,11 +911,23 @@ async def list_sales(date: Optional[str] = None, period: str = "day", status: st
 async def pos_summary(u=Depends(need("pos"))):
     sess = await session_view(await open_session())
     sales = await find("sales", {"session_id": sess["id"], **VALID_SALE}, limit=5000) if sess else []
-    by = {}
+    voided = await find("sales", {"session_id": sess["id"], "status": {"$in": ["void", "cancelled"]}}, limit=5000) if sess else []
+    by, by_detail = {}, {}
     for x in sales:
-        by[x["payment_method"]] = by.get(x["payment_method"], 0) + x["total"]
-    return {"count": len(sales), "total": round(sum(x["total"] for x in sales), 2),
-            "discount": round(sum(x["discount"] for x in sales), 2), "by_method": by,
+        pm = x["payment_method"]
+        by[pm] = by.get(pm, 0) + x["total"]
+        d = by_detail.setdefault(pm, {"count": 0, "amount": 0.0})
+        d["count"] += 1
+        d["amount"] = round(d["amount"] + x["total"], 2)
+    gross = round(sum(x["subtotal"] for x in sales), 2)
+    discount = round(sum(x["discount"] for x in sales), 2)
+    tax = round(sum(x.get("tax", 0) for x in sales), 2)
+    service = round(sum(x.get("service", 0) for x in sales), 2)
+    net = round(sum(x["total"] for x in sales), 2)
+    return {"count": len(sales), "total": net,
+            "discount": discount, "by_method": by, "by_method_detail": by_detail,
+            "gross": gross, "tax": tax, "service": service, "net": net,
+            "void_count": len(voided), "void_amount": round(sum(x["total"] for x in voided), 2),
             "opening_cash": sess["opening_cash"] if sess else 0, "shifts": sess["shifts"] if sess else [],
             "cash_ledger": await cash_ledger(sess),
             "closings": await find("register_closes", {"date": today()})}
@@ -1398,6 +1416,185 @@ async def dashboard(u=Depends(current_user)):
 def rng(period, date):
     d = date or today()
     return d if period == "day" else d[:7]
+
+
+# ---------------- Excel export (openpyxl) ----------------
+_HDR_FILL = PatternFill("solid", fgColor="1F6F54")
+_HDR_FONT = Font(bold=True, color="FFFFFF")
+_TITLE_FONT = Font(bold=True, size=14, color="1F6F54")
+_TOTAL_FONT = Font(bold=True)
+_THIN = Side(style="thin", color="D0D5DD")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+
+def _sheet_header(ws, headers, row_idx):
+    for ci, h in enumerate(headers, start=1):
+        c = ws.cell(row=row_idx, column=ci, value=h)
+        c.fill = _HDR_FILL
+        c.font = _HDR_FONT
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _BORDER
+
+
+def _autosize(ws):
+    from openpyxl.cell.cell import MergedCell
+    widths = {}
+    for row in ws.iter_rows():
+        for c in row:
+            if isinstance(c, MergedCell) or c.value is None:
+                continue
+            widths[c.column_letter] = max(widths.get(c.column_letter, 10), len(str(c.value)))
+    for letter, w in widths.items():
+        ws.column_dimensions[letter].width = min(max(w + 2, 11), 42)
+
+
+def _title_block(ws, cafe, label, period_label, ncols):
+    ws.cell(row=1, column=1, value=f"{cafe} — {label}").font = _TITLE_FONT
+    ws.cell(row=2, column=1, value=f"Periode: {period_label}")
+    ws.cell(row=3, column=1, value=f"Dibuat: {now().strftime('%d-%m-%Y %H:%M')}")
+    if ncols > 1:
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncols)
+
+
+@api.get("/reports/{rtype}/export")
+async def export_report(rtype: str, period: str = "day", date: Optional[str] = None, u=Depends(current_user)):
+    if rtype not in ("sales", "finance", "nota"):
+        raise HTTPException(404, "Unduhan Excel tidak tersedia untuk laporan ini")
+    if u["role"] not in ("owner", "finance"):
+        raise HTTPException(403, "Hanya Owner & Finance yang dapat mengunduh laporan")
+    p = rng(period, date)
+    q = {"date": {"$regex": f"^{p}"}}
+    st = await get_settings()
+    cafe = (st.get("receipt") or {}).get("cafe_name") or "ROLLOW"
+    label = {"sales": "Rekap Penjualan", "finance": "Laporan Keuangan", "nota": "Rekap per Nota"}[rtype]
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    if rtype == "sales":
+        allsales = await find("sales", q, limit=20000)
+        valid = [s for s in allsales if s.get("status", "paid") not in ("void", "cancelled")]
+        menus = await find("menus", limit=2000)
+        mcat = {m["id"]: (m.get("category") or "", m.get("sub_category") or "") for m in menus}
+        agg, tx = {}, {}
+        for s in valid:
+            for i in s["items"]:
+                key = i["name"]
+                a = agg.setdefault(key, {"name": key, "cat": mcat.get(i.get("menu_id"), ("", ""))[0],
+                                         "sub": mcat.get(i.get("menu_id"), ("", ""))[1], "qty": 0, "omzet": 0.0, "cogs": 0.0})
+                a["qty"] += i["qty"]
+                a["omzet"] += i.get("subtotal", 0)
+                a["cogs"] += i.get("hpp", 0)
+                tx.setdefault(key, set()).add(s["number"])
+        tot_qty = sum(a["qty"] for a in agg.values()) or 1
+        tot_omzet = sum(a["omzet"] for a in agg.values()) or 1
+        # Sheet 1: Rekap Menu
+        ws = wb.create_sheet("Rekap Menu")
+        _title_block(ws, cafe, "Rekap Penjualan per Menu", p, 9)
+        heads = ["Menu", "Kategori", "Sub Kategori", "Qty Terjual", "% Qty", "Penjualan", "% Penjualan", "COGS", "Margin"]
+        hr = 5
+        _sheet_header(ws, heads, hr)
+        r = hr + 1
+        for a in sorted(agg.values(), key=lambda x: -x["omzet"]):
+            margin = round(a["omzet"] - a["cogs"], 2)
+            vals = [a["name"], a["cat"], a["sub"], a["qty"], round(a["qty"] / tot_qty * 100, 2),
+                    round(a["omzet"], 2), round(a["omzet"] / tot_omzet * 100, 2), round(a["cogs"], 2), margin]
+            for ci, v in enumerate(vals, start=1):
+                ws.cell(row=r, column=ci, value=v).border = _BORDER
+            r += 1
+        for ci, v in enumerate(["TOTAL", "", "", sum(a["qty"] for a in agg.values()), 100.0,
+                                round(sum(a["omzet"] for a in agg.values()), 2), 100.0,
+                                round(sum(a["cogs"] for a in agg.values()), 2),
+                                round(sum(a["omzet"] - a["cogs"] for a in agg.values()), 2)], start=1):
+            c = ws.cell(row=r, column=ci, value=v)
+            c.font = _TOTAL_FONT
+            c.border = _BORDER
+        _autosize(ws)
+        # Sheet 2: Detail Transaksi
+        ws2 = wb.create_sheet("Detail Transaksi")
+        _title_block(ws2, cafe, "Detail Transaksi Penjualan", p, 15)
+        heads2 = ["No Transaksi", "Tanggal", "Jam", "Kasir", "Pelanggan", "Mode", "Metode Pembayaran", "Status",
+                  "Subtotal", "Diskon", "Pajak", "Service", "Total", "HPP", "Laba"]
+        _sheet_header(ws2, heads2, 5)
+        r = 6
+        for s in sorted(allsales, key=lambda x: (x.get("date", ""), x.get("time", ""))):
+            vals = [s.get("number", ""), s.get("date", ""), s.get("time", ""), s.get("cashier_name", ""),
+                    s.get("customer") or "-", s.get("channel", "kasir"), s.get("payment_method", ""),
+                    s.get("status", "paid").upper(), round(s.get("subtotal", 0), 2), round(s.get("discount", 0), 2),
+                    round(s.get("tax", 0), 2), round(s.get("service", 0), 2), round(s.get("total", 0), 2),
+                    round(s.get("hpp", 0), 2), round(s.get("profit", 0), 2)]
+            for ci, v in enumerate(vals, start=1):
+                ws2.cell(row=r, column=ci, value=v).border = _BORDER
+            r += 1
+        _autosize(ws2)
+
+    elif rtype == "finance":
+        fin = await find("finance", q, limit=20000)
+        inc = sum(f["amount"] for f in fin if f["type"] == "income")
+        exp = sum(f["amount"] for f in fin if f["type"] == "expense")
+        ws = wb.create_sheet("Ringkasan")
+        _title_block(ws, cafe, "Laporan Keuangan — Ringkasan", p, 2)
+        rows = [("Total Pemasukan", round(inc, 2)), ("Total Pengeluaran", round(exp, 2)),
+                ("Cash Flow Bersih", round(inc - exp, 2))]
+        _sheet_header(ws, ["Keterangan", "Nominal"], 5)
+        r = 6
+        for k, v in rows:
+            ws.cell(row=r, column=1, value=k).border = _BORDER
+            ws.cell(row=r, column=2, value=v).border = _BORDER
+            r += 1
+        ws.cell(row=5 + 1, column=1).font = _TOTAL_FONT
+        # per-category breakdown
+        cats = {}
+        for f in fin:
+            key = (f["type"], f.get("category", "Lainnya"))
+            cats[key] = round(cats.get(key, 0) + f["amount"], 2)
+        ws.cell(row=r + 1, column=1, value="Rincian per Kategori").font = _TOTAL_FONT
+        _sheet_header(ws, ["Tipe", "Kategori", "Nominal"], r + 2)
+        rr = r + 3
+        for (t, c), v in sorted(cats.items(), key=lambda x: (x[0][0], -x[1])):
+            ws.cell(row=rr, column=1, value="Pemasukan" if t == "income" else "Pengeluaran").border = _BORDER
+            ws.cell(row=rr, column=2, value=c).border = _BORDER
+            ws.cell(row=rr, column=3, value=v).border = _BORDER
+            rr += 1
+        _autosize(ws)
+        # detail sheet
+        ws2 = wb.create_sheet("Detail Transaksi")
+        _title_block(ws2, cafe, "Detail Mutasi Keuangan", p, 8)
+        _sheet_header(ws2, ["Tanggal", "Jam", "Tipe", "Kategori", "Metode", "Catatan", "User", "Nominal"], 5)
+        r = 6
+        for f in sorted(fin, key=lambda x: x.get("created_at", "")):
+            vals = [f.get("date", ""), (f.get("created_at") or "")[11:16],
+                    "Pemasukan" if f["type"] == "income" else "Pengeluaran", f.get("category", ""),
+                    f.get("method") or "-", f.get("note", ""), f.get("user_name", ""), round(f["amount"], 2)]
+            for ci, v in enumerate(vals, start=1):
+                ws2.cell(row=r, column=ci, value=v).border = _BORDER
+            r += 1
+        _autosize(ws2)
+
+    elif rtype == "nota":
+        allsales = await find("sales", q, limit=20000)
+        ws = wb.create_sheet("Rekap per Nota")
+        _title_block(ws, cafe, "Rekap per Nota", p, 12)
+        _sheet_header(ws, ["No Nota", "Tanggal", "Jam", "Status", "Metode", "Pelanggan", "Kasir",
+                           "Jml Item", "Subtotal", "Diskon", "Pajak", "Total"], 5)
+        r = 6
+        for s in sorted(allsales, key=lambda x: (x.get("date", ""), x.get("time", ""))):
+            vals = [s.get("number", ""), s.get("date", ""), s.get("time", ""), s.get("status", "paid").upper(),
+                    s.get("payment_method", ""), s.get("customer") or "-", s.get("cashier_name", ""),
+                    sum(i["qty"] for i in s.get("items", [])), round(s.get("subtotal", 0), 2),
+                    round(s.get("discount", 0), 2), round(s.get("tax", 0), 2), round(s.get("total", 0), 2)]
+            for ci, v in enumerate(vals, start=1):
+                ws.cell(row=r, column=ci, value=v).border = _BORDER
+            r += 1
+        _autosize(ws)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"{label.replace(' ', '')}_{p}.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @api.get("/reports/{rtype}")

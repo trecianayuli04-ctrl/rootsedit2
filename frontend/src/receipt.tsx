@@ -104,19 +104,58 @@ export async function printTickets(sale: any, settings: any, stations: Station[]
 export function closeReportLines(rec: any, settings: any): string[] {
   const W = colsFor(settings);
   const r = settings?.receipt || {};
+  const detail = settings?.close_report_detail !== false; // mode rinci default ON
   const led = rec || {};
   const sel = Math.round(led.selisih || 0);
   const selLabel = sel === 0 ? "SEIMBANG" : sel < 0 ? `KURANG ${money(Math.abs(sel))}` : `LEBIH ${money(sel)}`;
+  const net = led.net ?? led.total ?? 0;
   const out = [
     center(r.cafe_name || "RLW", W),
     center("LAPORAN TUTUP KASIR", W),
+    center(detail ? "(Mode Rinci)" : "(Mode Ringkas)", W),
     line(W, "="),
     lr("Tanggal", String(led.date || ""), W),
     lr("Jam Tutup", (led.created_at || "").slice(11, 16), W),
     lr("Ditutup oleh", led.user_name || "-", W),
     line(W),
     lr("Transaksi", String(led.count ?? 0), W),
-    lr("Total Penjualan", money(led.total || 0), W),
+    lr("Total Penjualan", money(net), W),
+  ];
+
+  if (detail) {
+    out.push(line(W), center("RINGKASAN PENJUALAN", W));
+    out.push(lr("Penjualan Kotor", money(led.gross || 0), W));
+    if (led.discount) out.push(lr("Diskon", `-${money(led.discount)}`, W));
+    if (led.service) out.push(lr("Service", `+${money(led.service)}`, W));
+    if (led.tax) out.push(lr(`Pajak`, `+${money(led.tax)}`, W));
+    out.push(lr("Penjualan Bersih", money(net), W));
+
+    const bmd = led.by_method_detail || {};
+    const keys = Object.keys(bmd);
+    out.push(line(W), center("PER METODE BAYAR", W));
+    if (keys.length) {
+      for (const k of keys) {
+        const d = bmd[k] || {};
+        out.push(lr(`${k} (${d.count || 0}x)`, money(d.amount || 0), W));
+      }
+    } else {
+      const bm = led.by_method || {};
+      for (const k of Object.keys(bm)) out.push(lr(k, money(bm[k]), W));
+    }
+
+    if ((led.void_count ?? 0) > 0 || (led.void_amount ?? 0) > 0) {
+      out.push(line(W), center("VOID / BATAL", W));
+      out.push(lr(`Jumlah Void/Batal (${led.void_count ?? 0}x)`, money(led.void_amount || 0), W));
+    }
+  } else {
+    const bm = led.by_method || {};
+    if (Object.keys(bm).length) {
+      out.push(line(W), center("PER METODE BAYAR", W));
+      for (const k of Object.keys(bm)) out.push(lr(k, money(bm[k]), W));
+    }
+  }
+
+  out.push(
     line(W),
     center("REKONSILIASI KAS (TUNAI)", W),
     lr("Kas Awal", money(led.kas_awal || 0), W),
@@ -127,18 +166,14 @@ export function closeReportLines(rec: any, settings: any): string[] {
     lr("SELISIH", `${sel > 0 ? "+" : ""}${money(sel)}`, W),
     center(selLabel, W),
     ...(led.selisih_note ? wrap(`Alasan: ${led.selisih_note}`, W) : []),
-  ];
+  );
+
   if (Array.isArray(led.shifts) && led.shifts.length) {
     out.push(line(W), center("PER SHIFT", W));
     for (const sh of led.shifts) {
       out.push(lr(`Shift ${sh.no} ${sh.user_name || ""}`.trim(), money(sh.total || 0), W));
       out.push(`  ${sh.start || ""}-${sh.end || "tutup"} - ${sh.count ?? 0} nota`.slice(0, W));
     }
-  }
-  const bm = led.by_method || {};
-  if (Object.keys(bm).length) {
-    out.push(line(W), center("PER METODE BAYAR", W));
-    for (const k of Object.keys(bm)) out.push(lr(k, money(bm[k]), W));
   }
   out.push(line(W, "="), ...wrap(r.footer_note, W).map((t) => center(t, W)));
   return out;

@@ -4,10 +4,13 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { rp, useApi } from "@/src/api";
 import { Role, useAuth } from "@/src/auth";
-import { Card, Chips, Header, Icon, Page, sp, Stat, StateView, useStyles } from "@/src/ui";
+import { downloadReport } from "@/src/export";
+import { Btn, Card, Chips, Header, Icon, Page, sp, Stat, StateView, useStyles, useToast } from "@/src/ui";
 import { useTheme } from "@/src/theme";
 
 const OPSM: Role[] = ["owner", "manager", "supervisor"];
+const EXPORTABLE = new Set(["sales", "finance", "nota"]);
+const EXPORT_ROLES: Role[] = ["owner", "finance"];
 const TYPES: { value: string; label: string; roles: Role[] }[] = [
   { value: "sales", label: "Penjualan", roles: ["owner", "manager", "supervisor", "finance", "marketing"] },
   { value: "nota", label: "Rekap per Nota", roles: [...OPSM, "finance"] },
@@ -33,12 +36,29 @@ export default function Reports() {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
+  const toast = useToast();
   const types = TYPES.filter((t) => t.roles.includes(user!.role));
   const [type, setType] = useState(types[0]?.value ?? "sales");
   const [period, setPeriod] = useState("day");
   const [date, setDate] = useState(() => shift(new Date().toISOString().slice(0, 10), "day", 0));
+  const [downloading, setDownloading] = useState(false);
   const { data, loading, error, reload } = useApi<any>(`/reports/${type}?period=${period}&date=${date}`);
   const isCount = (k: string) => type === "attendance" || MONEY_LABELS.includes(k);
+  const canExport = EXPORTABLE.has(type) && EXPORT_ROLES.includes(user!.role);
+
+  const onDownload = async () => {
+    const ref = period === "day" ? date : date.slice(0, 7);
+    const label = TYPES.find((t) => t.value === type)?.label || type;
+    setDownloading(true);
+    try {
+      await downloadReport(`/reports/${type}/export?period=${period}&date=${date}`, `${label}_${ref}.xlsx`);
+      toast("Laporan Excel diunduh");
+    } catch (e: any) {
+      toast(e?.message || "Gagal mengunduh laporan");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   return (
     <Page>
@@ -52,6 +72,11 @@ export default function Reports() {
         <Text style={s.title} testID="report-range-text">{period === "day" ? date : date.slice(0, 7)}</Text>
         <Pressable testID="report-next-button" hitSlop={8} onPress={() => setDate(shift(date, period, 1))} style={{ padding: sp.sm }}><Icon name="chevron-forward" size={22} color={colors.onSurface} /></Pressable>
       </View>
+      {canExport && (
+        <View style={{ paddingHorizontal: sp.lg, paddingBottom: sp.sm }}>
+          <Btn small variant="secondary" title="Unduh Excel" icon="download-outline" testID="report-download-excel-button" loading={downloading} onPress={onDownload} />
+        </View>
+      )}
       <FlatList
         data={data?.rows || []}
         keyExtractor={(_, i) => String(i)}

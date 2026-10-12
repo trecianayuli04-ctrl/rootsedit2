@@ -114,6 +114,8 @@ export default function Settings() {
             </View>
             <Toggle label="Pengeluaran kas kasir perlu persetujuan" value={!!f.petty_cash_needs_approval} onChange={set("petty_cash_needs_approval")} testID="petty-approval-switch" />
             <Field label="Batas wajar kas kecil (Rp, info)" testID="petty-limit-input" keyboardType="numeric" value={f.petty_cash_limit} onChangeText={set("petty_cash_limit")} />
+            <Toggle label="Laporan Tutup Kasir — Mode Rinci" value={f.close_report_detail !== false} onChange={set("close_report_detail")} testID="close-report-detail-switch" />
+            <Text style={s.sub}>Rinci: cetak ringkasan penjualan, pajak, rincian per metode bayar (QRIS, Cash, dll) & void. Nonaktif = ringkas.</Text>
           </Card>
           <Card>
             <Text style={[s.title, { marginBottom: sp.md }]}>QRIS & MDR</Text>

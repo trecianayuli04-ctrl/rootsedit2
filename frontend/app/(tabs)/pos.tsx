@@ -414,6 +414,27 @@ export default function POS() {
               <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Pemasukan tunai</Text><Text style={[s.title, { color: colors.success }]}>+{rp(closeReceipt.total_pemasukan_cash)}</Text></View>
               <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Pengeluaran tunai</Text><Text style={[s.title, { color: colors.error }]}>-{rp(closeReceipt.total_pengeluaran_cash)}</Text></View>
             </Card>
+            <Card style={{ gap: sp.xs }} testID="report-sales-summary">
+              <Text style={[s.title, { marginBottom: sp.xs }]}>Ringkasan Penjualan</Text>
+              <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Penjualan Kotor</Text><Text style={s.title}>{rp(closeReceipt.gross)}</Text></View>
+              {!!closeReceipt.discount && <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Diskon</Text><Text style={[s.title, { color: colors.error }]}>-{rp(closeReceipt.discount)}</Text></View>}
+              {!!closeReceipt.service && <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Service</Text><Text style={s.title}>+{rp(closeReceipt.service)}</Text></View>}
+              {!!closeReceipt.tax && <View style={[s.row, { justifyContent: "space-between" }]}><Text style={s.sub}>Pajak</Text><Text style={s.title}>+{rp(closeReceipt.tax)}</Text></View>}
+              <View style={[s.row, { justifyContent: "space-between" }]}><Text style={[s.sub, { fontWeight: "800" }]}>Penjualan Bersih</Text><Text style={[s.value, { color: colors.brandPrimary }]}>{rp(closeReceipt.net ?? closeReceipt.total)}</Text></View>
+            </Card>
+            {!!closeReceipt.by_method_detail && Object.keys(closeReceipt.by_method_detail).length > 0 && (
+              <Card style={{ gap: sp.xs }} testID="report-by-method">
+                <Text style={[s.title, { marginBottom: sp.xs }]}>Per Metode Bayar</Text>
+                {Object.entries(closeReceipt.by_method_detail).map(([k, d]: any) => (
+                  <View key={k} style={[s.row, { justifyContent: "space-between" }]} testID={`report-method-${k}`}>
+                    <Text style={s.sub}>{k} · {d.count || 0}x</Text><Text style={s.title}>{rp(d.amount)}</Text>
+                  </View>
+                ))}
+                {(closeReceipt.void_count ?? 0) > 0 && (
+                  <View style={[s.row, { justifyContent: "space-between" }]} testID="report-void"><Text style={[s.sub, { color: colors.error }]}>Void/Batal · {closeReceipt.void_count}x</Text><Text style={[s.title, { color: colors.error }]}>{rp(closeReceipt.void_amount)}</Text></View>
+                )}
+              </Card>
+            )}
             {!!closeReceipt.selisih_note && <Text style={s.sub} testID="report-selisih-note">Alasan selisih: {closeReceipt.selisih_note}</Text>}
             <Btn title="Cetak Laporan" icon="print-outline" testID="print-close-report-button" onPress={() => printCloseReport(closeReceipt, settings)} />
             <Btn title="Selesai" variant="secondary" testID="close-report-done-button" onPress={() => setCloseReceipt(null)} />
