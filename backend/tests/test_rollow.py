@@ -19,6 +19,11 @@ def tokens():
                           json={"email": f"{key}@rollow.id", "password": PW}, timeout=15)
         assert r.status_code == 200, f"login {key} -> {r.status_code} {r.text}"
         out[key] = r.json()["access_token"]
+    # sales require an open register session
+    hdr = {"Authorization": f"Bearer {out['crew']}"}
+    cur = requests.get(f"{BASE_URL}/api/register/current", headers=hdr, timeout=15).json()
+    if not cur.get("session"):
+        requests.post(f"{BASE_URL}/api/register/open", headers=hdr, json={"opening_cash": 100000}, timeout=15)
     return out
 
 
@@ -95,7 +100,7 @@ class TestPOSFlow:
         r = requests.post(f"{BASE_URL}/api/sales", headers=H(tokens["crew"]), json=payload)
         assert r.status_code == 200, r.text
         sale = r.json()
-        assert "number" in sale and sale["hpp"] > 0 and sale["profit"] == sale["total"] - sale["hpp"]
+        assert "number" in sale and sale["hpp"] > 0 and sale["profit"] == sale["total"] - sale.get("tax", 0) - sale["hpp"]
         if promo_id:
             assert sale["discount"] > 0
 
@@ -111,10 +116,12 @@ class TestPOSFlow:
     def test_pos_summary_then_close(self, tokens):
         s = requests.get(f"{BASE_URL}/api/pos/summary", headers=H(tokens["crew"]))
         assert s.status_code == 200 and s.json()["count"] >= 1
-        c = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]))
-        assert c.status_code == 200
+        c = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]),
+                          json={"kas_aktual": 0, "selisih_note": "TEST close"})
+        assert c.status_code == 200, c.text
         # closing again should 400 (no open trx)
-        c2 = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]))
+        c2 = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]),
+                           json={"kas_aktual": 0, "selisih_note": "TEST close"})
         assert c2.status_code == 400
 
 

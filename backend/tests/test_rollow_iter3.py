@@ -43,7 +43,8 @@ class TestPreCleanup:
     def test_close_any_open_session(self, tokens):
         cur = requests.get(f"{BASE_URL}/api/register/current", headers=H(tokens["owner"])).json()
         if cur.get("session"):
-            r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["owner"]))
+            r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["owner"]),
+                              json={"kas_aktual": 0, "selisih_note": "TEST cleanup"})
             assert r.status_code == 200
         cur = requests.get(f"{BASE_URL}/api/register/current", headers=H(tokens["owner"])).json()
         assert cur["session"] is None
@@ -345,8 +346,9 @@ class TestPayrollCreate:
 # ---------------- Close register ----------------
 class TestPosClose:
     def test_close_register(self, tokens):
-        r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]))
-        assert r.status_code == 200
+        r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]),
+                          json={"kas_aktual": 0, "selisih_note": "TEST close"})
+        assert r.status_code == 200, r.text
         d = r.json()
         assert "expected_cash" in d
         assert "shifts" in d
@@ -358,5 +360,6 @@ class TestPosClose:
         assert r.json()["session"] is None
 
     def test_close_fails_when_closed(self, tokens):
-        r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]))
+        r = requests.post(f"{BASE_URL}/api/pos/close", headers=H(tokens["crew"]),
+                          json={"kas_aktual": 0, "selisih_note": "TEST close"})
         assert r.status_code == 400

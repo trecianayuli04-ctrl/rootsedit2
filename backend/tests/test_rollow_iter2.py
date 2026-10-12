@@ -18,6 +18,11 @@ def tokens():
                           json={"email": f"{key}@rollow.id", "password": PW}, timeout=15)
         assert r.status_code == 200, f"{key} login {r.status_code} {r.text}"
         out[key] = r.json()["access_token"]
+    # sales require an open register session
+    hdr = {"Authorization": f"Bearer {out['crew']}"}
+    cur = requests.get(f"{BASE_URL}/api/register/current", headers=hdr, timeout=15).json()
+    if not cur.get("session"):
+        requests.post(f"{BASE_URL}/api/register/open", headers=hdr, json={"opening_cash": 100000}, timeout=15)
     return out
 
 
@@ -195,10 +200,10 @@ class TestVoid:
         cust_after = next(x for x in requests.get(f"{BASE_URL}/api/customers?q=Loyalti", headers=H(tokens["owner"])).json() if x["id"] == pytest.cust_id)
         assert cust_after["points"] == cust_before["points"] - pytest.points_earned
         assert cust_after["visits"] == cust_before["visits"] - 1
-        # finance negative lines appended
+        # finance lines are zeroed (Void = 0, bukan minus), never negative rows
         fin = requests.get(f"{BASE_URL}/api/finance", headers=H(tokens["owner"])).json()
-        neg = [f for f in fin if f.get("ref") == pytest.sale_id and f["amount"] < 0]
-        assert len(neg) >= 1
+        rows = [f for f in fin if f.get("ref") == pytest.sale_id]
+        assert rows and all(f["amount"] == 0 and f.get("voided") for f in rows)
 
     def test_double_void_400(self, tokens):
         r = requests.post(f"{BASE_URL}/api/sales/{pytest.sale_id}/void",
